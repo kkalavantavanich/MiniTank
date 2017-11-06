@@ -10,6 +10,7 @@
 #include <cstdint> 
 #include "RobotConnector.h"
 #include "easywsclient.hpp"
+#include <algorithm>
 
 #include <vector>
 
@@ -43,9 +44,24 @@ typedef float belief_t;
 std::smatch sm;
 std::regex re("id: (\\d+)\tpos: (-?\\d+\\.\\d+), (-?\\d+\\.\\d+), (-?\\d+\\.\\d+)\tangle: (-?\\d+\\.\\d+)<br\\/>");
 gps_t our_gps;
+int semaphore_rst = 4;
+int semaphore = semaphore_rst;
+
+vector<double> ang_in_buff;
+vector<double> x_in_buff;
+vector<double> y_in_buff;
+double ang_avg = 0;
+double x_avg = 0;
+double y_avg = 0;
+
+bool enableMeasuring;
 
 void handle_message(const std::string & message)
 {
+	if (semaphore == 0) {
+		return;
+	}
+	semaphore--;
 	if (message.find("end") != std::string::npos) {
 		wsk->close();
 		return;
@@ -78,6 +94,12 @@ void handle_message(const std::string & message)
 		wsDataframe.push_back(g);
 		if (g.id == 5) {
 			our_gps = g;
+			ang_avg += g.angle;
+			x_avg += g.x;
+			y_avg += g.y;
+			ang_in_buff.push_back(g.angle);
+			x_in_buff.push_back(g.x);
+			y_in_buff.push_back(g.y);
 		}
 		s = sm.suffix().str();
 	}
@@ -93,12 +115,12 @@ void bayesFilter(cv::Mat belief, vector<cv::Point> gridCells, vector<double> pro
 	buff.create(belief.rows, belief.cols, CV_32FC1);
 	assert(buff.rows == belief.rows);
 	assert(buff.cols == belief.cols);
-	
+
 	belief_t* beliefPtr = belief.ptr<belief_t>(0);
 	float* buffPtr = buff.ptr<float>(0);
 	for (int i = 0; i < buff.rows; i++) {
 		for (int col = 0; col < buff.cols; ++col) {
-			*buffPtr = (float) (((float) *beliefPtr) / 255.0);
+			*buffPtr = (float)(((float)*beliefPtr) / 255.0);
 			buffPtr++;
 			beliefPtr++;
 		}
@@ -108,7 +130,7 @@ void bayesFilter(cv::Mat belief, vector<cv::Point> gridCells, vector<double> pro
 
 	double n = 0;
 	int len = gridCells.size();
-	
+
 	// Check length of gridCells vs. probabilities
 	if (len != probs.size()) {
 		printf("Error in bayesFilter(): size of gridCells != size of probs.\n");
@@ -195,7 +217,7 @@ void bayesFilter2(cv::Mat belief, cv::Mat nextProbs) {
 			n += (*buffPtr);
 			buffPtr++;
 			nextProbPtr++;
-			max = max > (*buffPtr) ? max : (*buffPtr);
+			max = max >(*buffPtr) ? max : (*buffPtr);
 		}
 	}
 
@@ -240,9 +262,6 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 	for (int row = 0; row < buff.rows; row++) {
 		for (int col = 0; col < buff.cols; ++col) {
 			*buffPtr = (float)(((float)*beliefPtr) / 255.0);
-			if (row == 81 && col == 119) {
-				printf("bayesFilter3: buffPtr = %f, beliefPtr = %f\n", *buffPtr, *beliefPtr);
-			}
 			buffPtr++;
 			beliefPtr++;
 		}
@@ -259,8 +278,8 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 			if (false) {
 				printf("pos=(%d, %d), buff = %f, nextProb = %f, ", row, col, *buffPtr, *nextProbPtr);
 			}
-			(*buffPtr) = (*nextProbPtr)*(*buffPtr)/
-						 (((1-(*nextProbPtr))*(1-(*buffPtr)))+((*nextProbPtr)*(*buffPtr)));
+			(*buffPtr) = (*nextProbPtr)*(*buffPtr) /
+				(((1 - (*nextProbPtr))*(1 - (*buffPtr))) + ((*nextProbPtr)*(*buffPtr)));
 			(*buffPtr) = (*buffPtr) < 0.08 ? 0.08 : (*buffPtr);
 			if (false) {
 				printf("nextBuff = %f\n", *buffPtr);
@@ -287,8 +306,59 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 
 }
 
+bool closeSignal = false;
+
+void close() {
+	closeSignal = true;
+	wsk->close();
+	while (wsk->getReadyState() != wsk->CLOSED);
+}
+
+BOOL CtrlHandler(DWORD fdwCtrlType)
+{
+	switch (fdwCtrlType)
+	{
+		// Handle the CTRL-C signal. 
+	case CTRL_C_EVENT:
+		printf("Ctrl-C event\n\n");
+		close();
+		Beep(750, 300);
+		return(TRUE);
+
+		// CTRL-CLOSE: confirm that the user wants to exit. 
+	case CTRL_CLOSE_EVENT:
+		Beep(600, 200);
+		printf("Ctrl-Close event\n\n");
+		return(TRUE);
+
+		// Pass other signals to the next handler. 
+	case CTRL_BREAK_EVENT:
+		Beep(900, 200);
+		printf("Ctrl-Break event\n\n");
+		return FALSE;
+
+	case CTRL_LOGOFF_EVENT:
+		Beep(1000, 200);
+		printf("Ctrl-Logoff event\n\n");
+		return FALSE;
+
+	case CTRL_SHUTDOWN_EVENT:
+		Beep(750, 500);
+		printf("Ctrl-Shutdown event\n\n");
+		return FALSE;
+
+	default:
+		return FALSE;
+	}
+}
+
 int main() {
 	std::cout << "starting...\n";
+	if (!SetConsoleCtrlHandler((PHANDLER_ROUTINE)CtrlHandler, TRUE))
+	{
+		printf("\nERROR: Could not set control handler");
+		return 1;
+	}
 
 
 	// Robot Initialization
@@ -302,15 +372,19 @@ int main() {
 	robot.DriveDirect(0, 0);
 	cvNamedWindow("Robot");
 	*/
+
 	// Kinect Initialization
 	KinectConnector kin = KinectConnector();
 	if (!kin.Connect()) return 1;
 	std::cout << "initialized kinect\n";
 
 	// Grid Variables
-	double MILLIS_PER_GRID = 20;
+	double MILLIS_PER_GRID = 40;				// Cannot do less than 20 due to grid rough datatype size limit (uint16_t)
+	double ROUGH_MILLIS_PER_GRID = 160;
 	int GRID_HEIGHT = 7200 / MILLIS_PER_GRID;	// world size in mm
 	int GRID_WIDTH = 9600 / MILLIS_PER_GRID;	// world size in mm
+	int ROUGH_GRID_HEIGHT = 7200 / ROUGH_MILLIS_PER_GRID;	// world size in mm
+	int ROUGH_GRID_WIDTH = 9600 / ROUGH_MILLIS_PER_GRID;	// world size in mm
 	std::cout << "GRID SIZE = " << GRID_HEIGHT << "x" << GRID_WIDTH << "\n";
 	int GRID_VIEW_HEIGHT = 480;
 	int GRID_VIEW_WIDTH = 640;
@@ -318,28 +392,36 @@ int main() {
 	cv::resizeWindow("GRID VIEW", GRID_VIEW_WIDTH, GRID_VIEW_HEIGHT);
 	cv::Mat grid;											 // Main Grid Object (Greyscale)
 	cv::Mat gridView;										 // Grid Object use for viewing (RGB)
-	cv::Mat gridInt;								
+	cv::Mat gridInt;
+	cv::Mat gridRough;										// Use for motion planning
+	cv::Mat cBuff;
+	cv::Mat cSpace;											// (0 or 1) indicating C-Space
+
 	grid = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_32FC1, cv::Scalar(127));
 	gridInt = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_8UC1, cv::Scalar(127));
 	gridView = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_8UC3);
-	
+	gridRough = cv::Mat(ROUGH_GRID_HEIGHT, ROUGH_GRID_WIDTH, CV_16UC1, cv::Scalar(0));
+	cBuff = cv::Mat(ROUGH_GRID_HEIGHT, ROUGH_GRID_WIDTH, CV_8UC1, cv::Scalar(0));
+	cSpace = cv::Mat(ROUGH_GRID_HEIGHT, ROUGH_GRID_WIDTH, CV_8UC1, cv::Scalar(0));
+
 	// Get from GPS
 	cv::Point robotPoint(GRID_WIDTH / 2, GRID_HEIGHT / 2);	 // Current robot Position in Grid
 	long double robotDirection = 0.0;						 // Robot Direction in range (-180, 180)
 	int robotSize = 330;
 
-	cv::Point objectPoint;
-
 	double KINECT_FOV_H = NUI_CAMERA_COLOR_NOMINAL_HORIZONTAL_FOV;
 	double KINECT_FOV_V = NUI_CAMERA_DEPTH_NOMINAL_VERTICAL_FOV;
-	
+
 	// Debugging Variables
 	int loop_index = 0;				// Count how many loops have passed, use for debugging.
-	//int dt = robotData.distance;
+									//int dt = robotData.distance;
 
-	// Web Socket Initialization	
+	// Enable Measuring
+	enableMeasuring = false;
+
+									// Web Socket Initialization	
 	std::cout << "initializing ws...\n";
-	#ifdef _WIN32
+#ifdef _WIN32
 	INT rc;
 	WSADATA wsaData;
 
@@ -348,9 +430,9 @@ int main() {
 		printf("WSAStartup Failed.\n");
 		return 1;
 	}
-	#endif
+#endif
 
-	wsk = WebSocket::from_url("ws://192.168.1.59:8080/pose");
+	wsk = WebSocket::from_url("ws://192.168.1.59:8081/pose");
 	assert(wsk);
 
 	//while (wsk->getReadyState() != WebSocket::CLOSED) {
@@ -358,7 +440,7 @@ int main() {
 	//	wsk->send(" ");
 	//	wsk->poll(-1);
 	//	wsk->dispatch(handle_message);
-		//std::cout << "OUR_GPS: " << our_gps.id << " pos=(" << our_gps.x << ", " << our_gps.y << "), ang=" << our_gps.angle << "\n";
+	//std::cout << "OUR_GPS: " << our_gps.id << " pos=(" << our_gps.x << ", " << our_gps.y << "), ang=" << our_gps.angle << "\n";
 	//	Sleep(100);
 	//}
 	//delete wsk;
@@ -366,43 +448,68 @@ int main() {
 	//WSACleanup();
 	//#endif
 
+
+	cv::Mat nextProbs = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_32FC1, cv::Scalar(0.5));
+
 	// Main Loop // 
-	while (true) {
-		// Update Position
-		wsk->send("GET");
-		wsk->poll(-1);
-		wsk->dispatch(handle_message);
+	while (!closeSignal) {
+		// *_in_buff is used as median of 4 values
+		x_avg = 0;
+		y_avg = 0;
+		ang_avg = 0;
+		x_in_buff.clear();
+		y_in_buff.clear();
+		ang_in_buff.clear();
+		semaphore = semaphore_rst;
 
-		double ang_avg = our_gps.angle / 2;
+		for (int i = 0; i < 4; i++) {
+			
+		}
+		int sem_cnt = 0;
+		while (semaphore != 0) {
+			if (sem_cnt < semaphore_rst) {
+				sem_cnt++;
+				wsk->send("GET");
+				Sleep(10);
+			}
+			wsk->poll(-1);
+			wsk->dispatch(handle_message);
+			Sleep(10);
+		}
 
-		wsk->send("GET");
-		wsk->poll(-1);
-		wsk->dispatch(handle_message);
 
-		ang_avg += our_gps.angle / 2;
+		std::sort(x_in_buff.begin(), x_in_buff.end());
+		std::sort(y_in_buff.begin(), y_in_buff.end());
+		std::sort(ang_in_buff.begin(), ang_in_buff.end());
 
-		cv::Mat nextProbs = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_32FC1, cv::Scalar(0.5));
-		
+		for (auto it = x_in_buff.begin(); it != x_in_buff.end(); it++) {
+			std::cout << *it << " ";
+		}
+		std::cout << "\n";
+		x_avg = (x_in_buff[1] + x_in_buff[2] ) / 2;
+		y_avg = (y_in_buff[1] + y_in_buff[2]) / 2;
+		ang_avg = (ang_in_buff[1] + ang_in_buff[2]) / 2;
+
+		printf("(_main.cpp:457) <%d> Updated ANG_AVG from GPS\n", loop_index);
+
+		nextProbs.setTo(cv::Scalar(0.5));
+
 		cv::Mat depthImg;
 		cv::Mat colorImg;
 		cv::Mat indexImg;
 		cv::Mat pointImg;
 
-		// Testing Grid 
-		uchar* ap = grid.ptr<uchar>();
-		ap[10 * GRID_WIDTH + 10] = 255;
-		ap[11 * GRID_WIDTH + 11] = 127;
-		*(grid.ptr<uchar>(12, 12)) = 0;
-
 		// Get Data from Kinect
 		kin.GrabData(depthImg, colorImg, indexImg, pointImg);
+		printf("(_main.cpp:457) <%d> Grabbed Data from Kinect.\n", loop_index);
 		//if (!robot.ReadData(robotData))
 		//cout << "ReadData Fail" << endl;
 
 		// Make Center of ColorImg Red
 		for (int theta = -20; theta <= 20; theta++) {
 			if (theta == 0) {
-				double fd = (double)theta * colorImg.cols / 62;
+				//double fd = (double)theta * colorImg.cols / NUI_CAMERA_COLOR_NOMINAL_HORIZONTAL_FOV;
+				long double fd = 2 * NUI_CAMERA_COLOR_NOMINAL_FOCAL_LENGTH_IN_PIXELS * tan((long double) theta * MATH_PI / 180.0);
 				uchar* colorImgCenter = colorImg.ptr<uchar>(479, 639 - fd);
 				*colorImgCenter++ = 0;
 				*colorImgCenter++ = 0;
@@ -419,15 +526,15 @@ int main() {
 				*colorImgCenter++ = 255;
 			}
 			else {
-				double fd = (double)theta * colorImg.cols / 62;
-				uchar* colorImgCenter = colorImg.ptr<uchar>(479, 639 + fd);
+				double fd = (double)theta * colorImg.cols / 60;
+				uchar* colorImgCenter = colorImg.ptr<uchar>(479, 639 - fd);
 				*colorImgCenter++ = 255;
 				*colorImgCenter++ = 0;
 				*colorImgCenter++ = 0;
 				*colorImgCenter++ = 255;
 				*colorImgCenter++ = 0;
 				*colorImgCenter++ = 0;
-				colorImgCenter = colorImg.ptr<uchar>(480, 639 + fd);
+				colorImgCenter = colorImg.ptr<uchar>(480, 639 - fd);
 				*colorImgCenter++ = 255;
 				*colorImgCenter++ = 0;
 				*colorImgCenter++ = 0;
@@ -437,15 +544,27 @@ int main() {
 			}
 		}
 
+		printf("(_main.cpp:500) <%d> Set color dots for colorImg\n", loop_index);
+		
 		imshow("depthImg", depthImg);
 		imshow("colorImg", colorImg);
+
+		printf("(_main.cpp:505) <%d> Showed colorImg and depthImg\n", loop_index);
+
+		robotPoint.x = (x_avg * 10 / MILLIS_PER_GRID) + GRID_WIDTH / 2;
+		robotPoint.y = (y_avg * 10 / MILLIS_PER_GRID) + GRID_HEIGHT / 2;
+		printf("(_main.cpp:523) <%d> ang = %lf, x = %lf, y = %lf\n", loop_index, ang_avg, x_avg, y_avg);
+
 		//imshow("indexImg", indexImg);
 		//imshow("pointImg", pointImg);
 		vector<cv::Point> updatePoints;
 		vector<double> updateProbs;
+		vector<cv::Point> objectPoints;
 		for (int theta = -20; theta <= 20; theta++) {
 			// theta valid from approx. -30 to 30
-			double fd = (double)theta * depthImg.rows / 62;
+			// pixel_interested = center_pixel + (focal_length * 2 * tan(alpha))
+			//double fd = (double)theta * depthImg.rows / NUI_CAMERA_DEPTH_NOMINAL_HORIZONTAL_FOV;
+			long double fd = 2 * NUI_CAMERA_DEPTH_NOMINAL_FOCAL_LENGTH_IN_PIXELS * tan((long double) theta * MATH_PI / 180.0);
 			int16_t averagedPoints[4] = { *depthImg.ptr<int16_t>(239, 319 - fd),
 				*depthImg.ptr<int16_t>(239, 320 - fd),
 				*depthImg.ptr<int16_t>(240, 319 - fd),
@@ -456,7 +575,7 @@ int main() {
 			for (int i = 0; i < 4; i++) {
 				//std::cout << centerPoints[i] << " ";
 				// Kinect works from 0.5 - 4.5 meters
-				if (averagedPoints[i] > 500 && averagedPoints[i] < 2000) {
+				if (averagedPoints[i] > 500 && averagedPoints[i] < 3000) {
 					averagedDepth += averagedPoints[i];
 					validPointCount++;
 				}
@@ -467,6 +586,7 @@ int main() {
 			else {
 				averagedDepth = 0;
 			}
+
 			// map gps to robot world grid
 			robotDirection = ang_avg + theta;
 			if (robotDirection > 180) {
@@ -475,74 +595,155 @@ int main() {
 			else if (robotDirection < -180) {
 				robotDirection += 360;
 			}
-			robotPoint.x = (our_gps.x * 10 / MILLIS_PER_GRID) + GRID_WIDTH / 2;
-			robotPoint.y = (our_gps.y * 10 / MILLIS_PER_GRID) + GRID_HEIGHT / 2;
 
-			if (theta == 0) {
+			if (false) {
 				std::cout << "theta = " << theta << "\n";
 				std::cout << "ang_avg = " << ang_avg << ", theta = " << theta << "\n";
 				std::cout << "center: depth = " << averagedDepth << ", dir = " << robotDirection << ", pos=(" << robotPoint.x << ", " << robotPoint.y << ")\n";
 			}
-			long double objectDistMillis = averagedDepth;
-			long double objectDistDiffXMillis = objectDistMillis * sin(robotDirection * MATH_PI / 180);
-			long double objectDistDiffYMillis = objectDistMillis * cos(robotDirection * MATH_PI / 180);
+
+			cv::Point objectPoint;
+			long double LASER_RATIO = 10.0 / 6.0;
+			long double LASER_CONST = 100.0;
+			long double objectDistMillis = (long double)averagedDepth / abs(cos(theta * MATH_PI / 180.0));
+			bool isValidObjectDist = (objectDistMillis > MILLIS_PER_GRID);
+			objectDistMillis += LASER_CONST;
+			long double objectDistDiffXMillis = objectDistMillis * sin(robotDirection * MATH_PI / 180.0);
+			long double objectDistDiffYMillis = objectDistMillis * cos(robotDirection * MATH_PI / 180.0);
+			//long double objectDistDiffXMillis = averagedDepth * tan(theta * MATH_PI / 180);
+			//long double objectDistDiffYMillis = averagedDepth;
 			objectPoint.x = objectDistDiffXMillis / MILLIS_PER_GRID + robotPoint.x;
 			objectPoint.y = objectDistDiffYMillis / MILLIS_PER_GRID + robotPoint.y;
 
+			if (isValidObjectDist) {
+				objectPoints.push_back(objectPoint);
+			}
+
+			// Extrude shadow
 			cv::Point extrudePoint;
-			extrudePoint.x = (100 * sin(robotDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.x;
-			extrudePoint.y = (100 * cos(robotDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.y;
+			extrudePoint.x = (150 * sin(robotDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.x;
+			extrudePoint.y = (150 * cos(robotDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.y;
 
-			// Draw Interpolated Line to object
-			int blackPixelCnt = 0;
 			if (averagedDepth != 0) {
-				cv::LineIterator it_pre(grid, robotPoint, objectPoint, 8);
-				for (int i = 0; i < it_pre.count; i++, ++it_pre) {
-					if ((*grid.ptr<float>(it_pre.pos().y, it_pre.pos().x)) > 200) {
-						blackPixelCnt++;
-					}
-				}
-				if (blackPixelCnt < 5) {
-					cv::LineIterator it(grid, robotPoint, objectPoint, 8);
-					for (int i = 0; i < it.count; i++, ++it) {
-						updatePoints.push_back(it.pos());
-						if (i != it.count - 1) {
-							//(*it)[0] = 0;
-
-							// not object!
-							///(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.5;
-
-							(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.45;
-
-							//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.5 -  ((((4500 - objectDistMillis) / 4500) + (30 - abs(theta)) / 30) / 2)*0.1;
-
-							//updateProbs.push_back(0.8);
-						}
-						else {
-							//(*it)[0] = 255;
-							(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.55;
-							//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = ((((4500-objectDistMillis)/4500)+(30 - abs(theta))/30)/2)*0.1 + 0.5;
-							//updateProbs.push_back(1.25);
-						}
-					}
-				}
+				// Draw Interpolated from object to extrude point
 				cv::LineIterator it_ex(grid, objectPoint, extrudePoint, 8);
 				for (int i = 0; i < it_ex.count; i++, ++it_ex) {
 					(*nextProbs.ptr<float>(it_ex.pos().y, it_ex.pos().x)) = 0.52;
+				}
+			}
+
+			//printf("(_main.cpp:580) <%d> Get Depth Data from Kinect for theta = %d.\n", loop_index, theta);
+		}
+
+		
+
+		// Fill Black
+		for (int i = 0; i < objectPoints.size(); i++) {
+			cv::Point objectPoint = objectPoints[i];
+			(*nextProbs.ptr<float>(objectPoints[i].y, objectPoints[i].x)) = 0.55;
+		}
+
+		printf("(_main.cpp:593) <%d> Filled Black colors in nextProbs.\n", loop_index);
+
+		// Fill White
+		for (int i = 0; i < objectPoints.size(); i++) {
+			cv::Point objectPoint = objectPoints[i];
+			cv::LineIterator it(grid, robotPoint, objectPoint, 8);
+
+			for (int j = 0; j < it.count - 1; j++, ++it) {
+				if (i == 0 || i == objectPoints.size() - 1) {
+					(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.5;
+				}
+				else {
+					if ((*nextProbs.ptr<float>(it.pos().y, it.pos().x)) >= 0.54) {
+						break;
+					}
+					if (j != it.count - 1) {
+						//(*it)[0] = 0;
+
+						// not object!
+						///(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.5;
+
+						(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.45;
+
+						//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.5 -  ((((4500 - objectDistMillis) / 4500) + (30 - abs(theta)) / 30) / 2)*0.1;
+
+						//updateProbs.push_back(0.8);
+					}
+					//else {
+						//(*it)[0] = 255; 
+						//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.55;
+						//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = ((((4500-objectDistMillis)/4500)+(30 - abs(theta))/30)/2)*0.1 + 0.5;
+						//updateProbs.push_back(1.25);
+						//break;
+					//}
 				}
 			}
 		}
 
 		// Apply Bayes Filtering
 		//bayesFilter(grid, updatePoints, updateProbs);
-		bayesFilter3(grid, nextProbs);
+		if (enableMeasuring) {
+			bayesFilter3(grid, nextProbs);
+			printf("(_main.cpp:635) <%d> Completed bayesFilter3.\n", loop_index);
+		}
 
+
+		// Grid Clipping
 		for (int i = 0; i < GRID_HEIGHT * GRID_WIDTH; i++) {
 			if (grid.data[i] <= 3) grid.data[i] = 3;
 			else if (grid.data[i] >= 252) grid.data[i] = 252;
 		}
 
+		// Generate GridRough by summing corresponding cells in Grid
+		gridRough.setTo(cv::Scalar(0));
+		
+		int ROUGH_FACTOR = ROUGH_MILLIS_PER_GRID / MILLIS_PER_GRID;
+		printf("ROUGH_FACTOR = %d\n", ROUGH_FACTOR);
+		for (int i = 0; i < GRID_HEIGHT; i++) {
+			for (int j = 0; j < GRID_WIDTH; j++) {
+				*gridRough.ptr<uint16_t>(i / ROUGH_FACTOR, j / ROUGH_FACTOR) += *grid.ptr<float>(i, j);
+			}
+		}
 
+		for (int i = 0; i < ROUGH_GRID_HEIGHT; i++) {
+			for (int j = 0; j < ROUGH_GRID_WIDTH; j++) {
+				*gridRough.ptr<uint16_t>(i, j) /= (ROUGH_FACTOR * ROUGH_FACTOR);
+			}
+		}
+
+		cBuff.setTo(cv::Scalar(1));		// GREY
+		for (int i = 0; i < ROUGH_GRID_HEIGHT; i++) {
+			for (int j = 0; j < ROUGH_GRID_WIDTH; j++) {
+				if (*gridRough.ptr<uint16_t>(i, j) < 90) {
+					*cBuff.ptr<uchar>(i, j) = 0;		// FREE
+				} else if (*gridRough.ptr<uint16_t>(i, j) > 160) {
+					*cBuff.ptr<uchar>(i, j) = 2;		// OBJ
+				}
+				//*cBuff.ptr<uchar>(i, j) *= 127;
+				*cSpace.ptr<uchar>(i, j) = *cBuff.ptr<uchar>(i, j);
+			}
+		}
+
+		// Set C-Space
+		
+		int C_FACTOR = robotSize / (ROUGH_MILLIS_PER_GRID * 2 );
+		for (int i = 0; i < ROUGH_GRID_HEIGHT; i++) {
+			for (int j = 0; j < ROUGH_GRID_WIDTH; j++) {
+				if (*cBuff.ptr<uchar>(i, j) == 2) {
+					for (int di = std::max(i - C_FACTOR, 0); di <= std::min(i + C_FACTOR, ROUGH_GRID_HEIGHT); di++) {
+						for (int dj = std::max(j - C_FACTOR, 0); dj <= std::min(j + C_FACTOR, ROUGH_GRID_WIDTH); dj++) {
+							*cSpace.ptr<uchar>(di, dj) = 2;
+						}
+					}
+				}
+
+			}
+		}
+
+
+
+		// Convert Grid to Int
 
 		belief_t * gridPtr = grid.ptr<belief_t>(0);
 		uchar * gridIntPtr = gridInt.ptr<uchar>(0);
@@ -554,43 +755,62 @@ int main() {
 			}
 		}
 		cvtColor(gridInt, gridView, CV_GRAY2RGB);
-		
+		printf("(_main.cpp:657) <%d> Converted color from gridInt to gridView\n", loop_index);
 		for (int i = 0; i < (GRID_HEIGHT * GRID_WIDTH * 3); i++) {
 			gridView.data[i] = 255 - gridView.data[i];
-			
+
 			/*if (gridView.data[i] <= 110) {
-				gridView.data[i] = 0;
+			gridView.data[i] = 0;
 			}
 			else if (gridView.data[i] >= 130) {
-				gridView.data[i] = 255;
+			gridView.data[i] = 255;
 			}
 			*/
 		}
 
+		// Special Pixels Display //
 
-		uchar* playerPixel = gridView.ptr<uchar>(robotPoint.y, robotPoint.x);
-		*playerPixel++ = 100;
-		*playerPixel++ = 100;
-		*playerPixel = 255;
+		// Object Frontier Purple
+		uchar * debuggingPixel;
+		for (int i = 0; i < objectPoints.size(); i++) {
+			cv::Point objectPoint = objectPoints[i];
+			debuggingPixel = gridView.ptr<uchar>(objectPoint.y, objectPoint.x);
+			*debuggingPixel++ = 0;
+			*debuggingPixel++ = 0;
+			*debuggingPixel = 255;
+		}
 
+		// Player Red
+		uchar* playerPixel;
+		int playerRadius = (robotSize / MILLIS_PER_GRID) / 2;
+		for (int i = -playerRadius; i <= playerRadius; i++) {
+			for (int j = -playerRadius; j <= playerRadius; j++) {
+				playerPixel = gridView.ptr<uchar>(robotPoint.y + j, robotPoint.x + i);
+				*playerPixel++ = 75;
+				*playerPixel++ = 75;
+				*playerPixel = 255;
+			}
+		}
 
+		// Direction Green
 		uchar* dirPixel;
 		if (ang_avg < -135 || ang_avg > 135) {
-			dirPixel = gridView.ptr<uchar>(robotPoint.y - 1, robotPoint.x);
+			dirPixel = gridView.ptr<uchar>(robotPoint.y - 1 - playerRadius, robotPoint.x);
 		}
 		else if (ang_avg < -45 && ang_avg > -135) {
-			dirPixel = gridView.ptr<uchar>(robotPoint.y, robotPoint.x - 1);
+			dirPixel = gridView.ptr<uchar>(robotPoint.y, robotPoint.x - 1 - playerRadius);
 		}
 		else if (ang_avg < 45 && ang_avg > -45) {
-			dirPixel = gridView.ptr<uchar>(robotPoint.y + 1, robotPoint.x);
+			dirPixel = gridView.ptr<uchar>(robotPoint.y + 1 + playerRadius, robotPoint.x);
 		}
 		else if (ang_avg < 135 && ang_avg > 45) {
-			dirPixel = gridView.ptr<uchar>(robotPoint.y, robotPoint.x + 1);
+			dirPixel = gridView.ptr<uchar>(robotPoint.y, robotPoint.x + 1 + playerRadius);
 		}
 		*dirPixel++ = 100;
 		*dirPixel++ = 255;
 		*dirPixel = 100;
 
+		// Blue Corner
 		uchar * cornerPixels[4] = {
 			gridView.ptr<uchar>(0,0),
 			gridView.ptr<uchar>(0,gridView.cols - 1),
@@ -603,14 +823,29 @@ int main() {
 			*cornerPixel++ = 100;
 			*cornerPixel = 100;
 		}
-		
+
+		printf("(_main.cpp:726) <%d> Setted special pixel colors on GRID_VIEW.\n", loop_index);
+
 		//uchar* objectPixel = gridView.ptr<uchar>(81, 119);
 		//*objectPixel++ = 255;
 		//*objectPixel++ = 30;
 		//*objectPixel = 30;
 		imshow("GRID VIEW", gridView);
-		cv::waitKey(50);
 
+		//cv::namedWindow("GRID_ROUGH_VIEW", cv::WINDOW_NORMAL);
+		//cv::resizeWindow("GRID_ROUGH_VIEW", GRID_VIEW_WIDTH, GRID_VIEW_HEIGHT);
+		//imshow("GRID_ROUGH_VIEW", cSpace);
+
+
+		printf("(_main.cpp:735) <%d> Show GRID_VIEW Image.\n", loop_index);
+
+		int userInput = cv::waitKey(100);
+		if (userInput == ' ') {
+			enableMeasuring = !enableMeasuring;
+		}
+
+		printf("(_main.cpp:742) <%d> Waited for user input (cvWaitKey).\n", loop_index);
+		
 		loop_index++;
 		//printf("===============================================\n");
 	}
