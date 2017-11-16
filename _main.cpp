@@ -21,53 +21,353 @@
 #include "opencv2/calib3d/calib3d.hpp"
 #include "opencv2/highgui/highgui.hpp"
 
+
 #define MATH_PI 3.14159265358979323846264
 
-
 #define Create_Comport "COM3"
+#define RIGHT 3
+#define UP 0
+#define LEFT 1
+#define DOWN 2
 
+/* WebSocket Object used to connect to the GPS. */
 using easywsclient::WebSocket;
 static WebSocket::pointer wsk = NULL;
 
+
 double vx = 0;
 double vz = 0;
-char direction = ' ';
+int direction = 0 ;
+double  pointx[4] = { 227.321, -221.07 , -185.694 , 245.306 };
+double  pointy[4] = { -169.261 , -173.538 , 168.853, 164.846 };
 
+/* Data Type Object (DTO) of data retrieved from GPS. */
 typedef struct {
 	int id;
 	double x, y, z;
 	double angle;
 } gps_t;
 
+/* Type of each grid cell (aka. belief grid). */
 typedef float belief_t;
 
+/* Regex objects used to match incoming string from GPS WebSocket. */
 std::smatch sm;
 std::regex re("id: (\\d+)\tpos: (-?\\d+\\.\\d+), (-?\\d+\\.\\d+), (-?\\d+\\.\\d+)\tangle: (-?\\d+\\.\\d+)<br\\/>");
+
 gps_t our_gps;
 int semaphore_rst = 4;
 int semaphore = semaphore_rst;
 
-vector<double> ang_in_buff;
-vector<double> x_in_buff;
-vector<double> y_in_buff;
+/* Buffers used for averaging measurements retrieved from the GPS.*/
+std::vector<double> ang_in_buff;
+std::vector<double> x_in_buff;
+std::vector<double> y_in_buff;
+
+/* Average measurements retrieved from the GPS.*/
 double ang_avg = 0;
 double x_avg = 0;
 double y_avg = 0;
 
-bool enableMeasuring;
+/* enableMeasuring: use this variable to set whether a measurement is made and updated on the main grid.*/
+bool enableMeasuring ;
 
+double calculateangle(double x, double y,double ang) {
+	double angle = 0;
+	double min=99999999;
+	int index;
+	for (int i = 0; i < 4; i++) {
+		double distance = sqrt( ( ( x-pointx[i])*(x - pointx[i])) + ( ( y - pointy[i])*(y - pointy[i])));
+		if (distance < min) {
+			min = distance;
+			index = i;
+		}
+	}
+	double angs = atan2(abs(pointy[index]-y), abs(pointx[index]-x)) * 180/MATH_PI;
+	cout << "Angle : " << angs << endl;
+	if (x > 0 && y > 0) {
+		angle = angs;
+	}
+	else if (x > 0 && y <= 0) {
+		angle = 180 - angs;
+	}
+	else if (x <= 0 && y > 0) {
+		angle = -1 * (angs);
+	}
+	else if (x <= 0 && y <= 0) {
+		angle = -1*(180 - angs);
+	}
+	cout << "Index : " << index << " Angle : " << angle <<endl;
+	//0 Top right 1 Top left 2 Bottom left  3 Bottom right ;
+	return angle;
+}
+
+/* _movePrototype: Move robot with velocity vx, vz for time millis (and post-delay for 10ms)
+ * This method is intended to be used inside other moving functions, e.g. turnRight().
+ *
+ * @param robot		The robot to control
+ * @param vx		The velocity in the X-axis (forward direction); in range [-1.0, 1.0]
+ * @param vz		The velocity in the Z-axis (turning direction); in range [-1.0, 1.0]
+ * @param millis	The duration of time in milliseconds to move with velocities {vx, vz}.
+ */
+void _movePrototype(RobotConnector &robot, double vx, double vz, double millis) {
+
+	double vl = vx - vz;
+	double vr = vx + vz;
+
+	int velL = (int)(vl*Create_MaxVel);
+	int velR = (int)(vr*Create_MaxVel);
+
+	if (!robot.DriveDirect(velL, velR))
+		std::cout << "(_main.cpp:91) [ERROR] SetControl Fail\n";
+
+	Sleep(millis);
+
+	if (!robot.DriveDirect(0, 0))
+		std::cout << "(_main.cpp:96) [ERROR] SetControl Fail\n";
+
+	Sleep(50);
+}
+
+
+/* turnRight : Turn the robot right (Clockwise) by the specified angle.
+ * This function can be fine-tuned to fit physical needs by adjusting the local 'factor' variable. 
+ *
+ * @param angle		The angle to turn, in degrees. >0
+ */
+void turnRight(RobotConnector &robot, double angle) {
+	double vx, vz;
+	vx = 0;
+	vz = -0.5;
+	double factor = 10.0;		// Conversion factor from angle to turning time.
+	long millis = angle * factor;
+
+	_movePrototype(robot, vx, vz, millis);
+}
+
+/* turnLeft : Turn the robot left (Counter-clockwise) by the specified angle.
+* This function can be fine-tuned to fit physical needs by adjusting the local 'factor' variable.
+*
+* @param angle		The angle to turn, in degrees. >0
+*/
+void turnLeft(RobotConnector &robot, double angle ) {
+	double vx, vz;
+	vx = 0;
+	vz = 0.5;
+
+	double factor = 10.0;		// Conversion factor from angle to turning time.
+	long millis = angle * factor;
+
+	_movePrototype(robot, vx, vz, millis);
+}
+
+/* moveForward : Move the robot in the direction it is facing by specified length.
+* This function can be fine-tuned to fit physical needs by adjusting the local 'factor' variable.
+*
+* @param length		The distance to move, in arbitrary units.
+*/
+void moveForward(RobotConnector &robot, double length) {
+	double vx, vz;
+	vx = 0.5;
+	vz = 0;
+
+	double factor = 40.0;	// Conversion factor from length to turning time.
+	long millis = length * factor;
+
+	_movePrototype(robot, vx, vz, millis);
+}
+
+
+
+int checkmap(cv::Mat cSpace, int x, int y) {
+	int direc;
+	direc = 0;
+	/*
+	switch (direction)
+	{
+	case 0:
+			if (*cSpace.ptr<uchar>(y + 5, x) == 0 && y + 5 < 80) {
+				direc = 0;
+			}
+			else if (*cSpace.ptr<uchar>(y, x + 5) == 0 && x + 5 < 60) {
+				direc = 1;
+			}
+			else if (*cSpace.ptr<uchar>(y - 5, x) == 0 && y - 5 > 0) {
+				direc = 2;
+			}
+			else {
+				direc = 3;
+			}
+	case 1:
+		for (int i = 0; i < 10; i++) {
+			if (*cSpace.ptr<uchar>(y, x + 5) == 1 && x + 5 < 60 )  {
+				direc = 0;
+			}
+			else if (*cSpace.ptr<uchar>(y - 5, x) == 1 && y - 5 > 0) {
+				direc = 1;
+			}
+			else if (*cSpace.ptr<uchar>(y, x - 5) == 1 && x - 5 > 0 ) {
+				direc = 2;
+			}
+			else {
+				direc = 3;
+			}
+		}
+	case 2:
+		for (int i = 0; i < 10; i++) {
+			if (*cSpace.ptr<uchar>(y - 5, x) == 1 && y - 5 > 0) {
+				direc = 0;
+			}
+			else if (*cSpace.ptr<uchar>(y, x - 5) == 1 && x - 5 > 0) {
+				direc = 1;
+			}
+			else if (*cSpace.ptr<uchar>(y + 5, x) == 1 && y + 5 < 80) {
+				direc = 2;
+			}
+			else {
+				direc = 3;
+			}
+		}
+	case 3:
+		for (int i = 0; i < 10; i++) {
+			if (*cSpace.ptr<uchar>(y, x - 5) == 1 && x - 5 > 0) {
+				direc = 0;
+			}
+			else if (*cSpace.ptr<uchar>(y + 5, x) == 1 && y + 5 < 80) {
+				direc = 1;
+			}
+			else if (*cSpace.ptr<uchar>(y, x + 5) == 1 && x + 5 < 60) {
+				direc = 2;
+			}
+			else {
+				direc = 3;
+			}
+		}
+
+	}
+	*/
+	// direc = 0  Turnright
+	// direc = 1  Forward
+	// direc = 2  Turnleft
+	// direc = 3  Backward
+	return direc;
+}
+
+/*
+class BenRobor {
+public:
+BenRobor(int x, int y, int direction) {
+position = make_pair(x, y);
+this->direction = direction;
+
+}
+pair<int, int> position;
+int direction;
+bool right(int(&map)[640][480]) {
+if (direction == RIGHT) {
+if (position.second + 1 > 479) {
+return false;
+}
+if (map[position.second + 1][position.first] != 0) {
+return false;
+}
+return  true;
+}
+if (direction == UP) {
+if (position.first + 1 > 639) {
+return false;
+}
+if (map[position.second][position.first + 1] != 0) {
+return false;
+}
+return  true;
+}
+if (direction == LEFT) {
+if (position.second - 1 <0) {
+return false;
+}
+if (map[position.second - 1][position.first] != 0) {
+return false;
+}
+return  true;
+}
+if (direction == DOWN) {
+if (position.first - 1 < 0) {
+return false;
+}
+if (map[position.second][position.first - 1] != 0) {
+return false;
+}
+return  true;
+}
+}
+bool up(int(&map)[640][480]) {
+turnleft();
+right(map);
+turnright;
+}
+bool left(int(&map)[640][480]) {
+turnleft();
+up(map);
+turnright;
+}
+void turnleft() {
+direction = (direction + 1) % 4;
+}
+void turnright() {
+direction = (direction + 3) % 4;
+}
+void setDirection(pair<int, int> p) {
+if (p.first - position.first == 1) {
+direction = RIGHT;
+}
+else if (p.second - position.second == -1) {
+direction = UP;
+}
+else if (p.first - position.first == -1) {
+direction = LEFT;
+}
+else if (p.second - position.second == 1) {
+direction = DOWN;
+}
+}
+};
+BenRobor(robotPoint.x, robotPoint.y, ) ben;
+if (!ben.right()) {
+if (!ben.up()) {
+if (!ben.left()) {
+ben.setposition(mempath.pop());
+}
+else {
+ben.turnleft();
+mempath.push(ben.position);
+}
+}
+else {
+mempath.push(ben.position);
+}
+}
+else {
+ben.turnright();
+mempath.push(ben.position);
+}
+*/
+
+
+/* handle_message: use this to handle an event-received message by WebSocket. 
+ * The current implementation is to regex into the message and find gps_t which id == 5.
+ * Additionally, WebSocket will also close if the string 'end' is found in the response message.
+ *
+ * @param message		response message received from the server.
+ */
 void handle_message(const std::string & message)
 {
-	if (semaphore == 0) {
-		return;
-	}
-	semaphore--;
 	if (message.find("end") != std::string::npos) {
 		wsk->close();
 		return;
 	}
 	std::string s = message;
-	vector<gps_t> wsDataframe;
+	std::vector<gps_t> wsDataframe;
 	while (std::regex_search(s, sm, re)) {
 		int i = 0;
 		gps_t g;
@@ -93,6 +393,7 @@ void handle_message(const std::string & message)
 		}
 		wsDataframe.push_back(g);
 		if (g.id == 5) {
+			printf("(_main.cpp:365) [INFO] found GPS data in stream!\n");
 			our_gps = g;
 			ang_avg += g.angle;
 			x_avg += g.x;
@@ -105,10 +406,19 @@ void handle_message(const std::string & message)
 	}
 }
 
+
+/* bayesFilter: 1st implementation of a bayesFilter.
+ * Accepts only perceptual data (from depth sensors).
+ * 
+ * @param belief	 The main grid Matrix (aka. belief grid)
+ * @param gridCells	 The cells which is to be updated (by values in probs vector)
+ * @param probs		 The probability to update the specified gridCells.
+ */
+
 // updates in-place! (side-effect)
 // receive only perceptual data (sensors)
 // TODO: implement action data (motion)
-void bayesFilter(cv::Mat belief, vector<cv::Point> gridCells, vector<double> probs) {
+void bayesFilter1(cv::Mat belief, std::vector<cv::Point> gridCells, std::vector<double> probs) {
 	// Create Buffer Matrix which is a float version of belief matrix
 	// Values in buffer matrix are in range [0, 1].
 	cv::Mat buff;
@@ -133,11 +443,11 @@ void bayesFilter(cv::Mat belief, vector<cv::Point> gridCells, vector<double> pro
 
 	// Check length of gridCells vs. probabilities
 	if (len != probs.size()) {
-		printf("Error in bayesFilter(): size of gridCells != size of probs.\n");
+		printf("(_main.cpp:415) [ERROR] in bayesFilter1(): size of gridCells != size of probs.\n");
 	}
 
 	if (len == 0) {
-		printf("Error in bayesFilter(): InvalidArgument len = 0\n");
+		printf("(_main.cpp:419) [ERROR] in bayesFilter1(): InvalidArgument len = 0\n");
 	}
 
 	// This is not exact implementation of Bayes Filter Algorithm
@@ -149,11 +459,11 @@ void bayesFilter(cv::Mat belief, vector<cv::Point> gridCells, vector<double> pro
 		float* cellPtr = buff.ptr<float>(p.y, p.x);
 		uchar* beliefCellPtr = belief.ptr<uchar>(p.y, p.x);
 		if (false) {
-			printf("pos=(%d, %d), *belCellPtr = %d, *cellPtr = %f, prob = %lf, ", p.x, p.y, *beliefCellPtr, *cellPtr, prob);
+			printf("(_main.cpp:431) [DEBUG] pos=(%d, %d), *belCellPtr = %d, *cellPtr = %f, prob = %lf, ", p.x, p.y, *beliefCellPtr, *cellPtr, prob);
 		}
 		(*cellPtr) *= prob;
 		if (false) {
-			printf("afterCellPtr = %f\n", *cellPtr);
+			printf("(_main.cpp:435) [DEBUG] afterCellPtr = %f\n", *cellPtr);
 		}
 		n += (*cellPtr);
 		maxCell = maxCell > *cellPtr ? maxCell : *cellPtr;
@@ -174,12 +484,18 @@ void bayesFilter(cv::Mat belief, vector<cv::Point> gridCells, vector<double> pro
 		cv::Point p = gridCells[i];
 		int val = (*buff.ptr<float>(p.y, p.x)) * 255 / maxCell;
 		if (val > 255 || val < 0) {
-			printf("error in bayes filter: val overflow at pos(%d, %d) val=%d.\n", p.x, p.y, val);
+			printf("(_main.cpp:456) [ERROR] in bayesFilter1: val overflow at pos(%d, %d) val=%d.\n", p.x, p.y, val);
 		}
 		(*belief.ptr<belief_t>(p.y, p.x)) = val;
 	}
 }
 
+/* bayesFilter2: 2nd implementation of a bayesFilter.
+* Accepts only perceptual data (from depth sensors).
+*
+* @param belief		 The main grid Matrix (aka. belief grid)
+* @param nextProbs	 The probability Matrix to update each grid cells.
+*/
 
 void bayesFilter2(cv::Mat belief, cv::Mat nextProbs) {
 	// Create Buffer Matrix which is a float version of belief matrix
@@ -202,7 +518,7 @@ void bayesFilter2(cv::Mat belief, cv::Mat nextProbs) {
 	}
 
 	if (nextProbs.rows != buff.rows || nextProbs.cols != buff.cols) {
-		printf("Error: buff size != nextProbs size");
+		printf("(_main.cpp:490) [ERROR] : buff size != nextProbs size");
 	}
 
 	float max = 0;
@@ -211,7 +527,7 @@ void bayesFilter2(cv::Mat belief, cv::Mat nextProbs) {
 	for (int row = 0; row < buff.rows; row++) {
 		for (int col = 0; col < buff.cols; col++) {
 			if (false) {
-				printf("pos=(%d, %d), buff = %f, nextProb = %f\n", row, col, *buffPtr, *nextProbPtr);
+				printf("(_main.cpp:499) [DEBUG] : pos=(%d, %d), buff = %f, nextProb = %f\n", row, col, *buffPtr, *nextProbPtr);
 			}
 			(*buffPtr) *= (*nextProbPtr);
 			n += (*buffPtr);
@@ -238,7 +554,7 @@ void bayesFilter2(cv::Mat belief, cv::Mat nextProbs) {
 		for (int col = 0; col < buff.cols; col++) {
 			int val = (*buffPtr) * 255.0 / max;
 			if (val > 255 || val < 0) {
-				printf("error in bayes filter: val overflow at val=%d.\n", val);
+				printf("(_main.cpp:526) [ERROR] in bayesFilter2: val overflow at val=%d.\n", val);
 			}
 			*beliefPtr = val;
 			buffPtr++;
@@ -248,6 +564,13 @@ void bayesFilter2(cv::Mat belief, cv::Mat nextProbs) {
 
 }
 
+
+/* bayesFilter3: 3rd implementation of a bayesFilter.
+* Accepts only perceptual data (from depth sensors).
+*
+* @param belief		 The main grid Matrix (aka. belief grid)
+* @param nextProbs	 The probability Matrix to update each grid cells.
+*/
 void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 	// Create Buffer Matrix which is a float version of belief matrix
 	// Values in buffer matrix are in range [0, 1].
@@ -258,7 +581,7 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 
 	belief_t* beliefPtr = belief.ptr<belief_t>(0);
 	float* buffPtr = buff.ptr<float>(0);
-	printf("bayesFilter3: buff.rows = %d, buff.cols = %d\n", buff.rows, buff.cols);
+	printf("(_main.cpp:553) [INFO] in bayesFilter3: buff.rows = %d, buff.cols = %d\n", buff.rows, buff.cols);
 	for (int row = 0; row < buff.rows; row++) {
 		for (int col = 0; col < buff.cols; ++col) {
 			*buffPtr = (float)(((float)*beliefPtr) / 255.0);
@@ -268,7 +591,7 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 	}
 
 	if (nextProbs.rows != buff.rows || nextProbs.cols != buff.cols) {
-		printf("Error: buff size != nextProbs size");
+		printf("(_main.cpp:563) [ERROR] in bayesFilter3: buff size != nextProbs size");
 	}
 
 	buffPtr = buff.ptr<float>(0);
@@ -276,13 +599,13 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 	for (int row = 0; row < buff.rows; row++) {
 		for (int col = 0; col < buff.cols; col++) {
 			if (false) {
-				printf("pos=(%d, %d), buff = %f, nextProb = %f, ", row, col, *buffPtr, *nextProbPtr);
+				printf("(_main.cpp:571) [DEBUG] pos=(%d, %d), buff = %f, nextProb = %f, ", row, col, *buffPtr, *nextProbPtr);
 			}
 			(*buffPtr) = (*nextProbPtr)*(*buffPtr) /
 				(((1 - (*nextProbPtr))*(1 - (*buffPtr))) + ((*nextProbPtr)*(*buffPtr)));
 			(*buffPtr) = (*buffPtr) < 0.08 ? 0.08 : (*buffPtr);
 			if (false) {
-				printf("nextBuff = %f\n", *buffPtr);
+				printf("(_main.cpp:577) [DEBUG] nextBuff = %f\n", *buffPtr);
 			}
 			buffPtr++;
 			nextProbPtr++;
@@ -296,7 +619,7 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 		for (int col = 0; col < buff.cols; col++) {
 			int val = (*buffPtr) * 255.0;
 			if (val > 255 || val < 0) {
-				printf("error in bayes filter: val overflow at val=%d.\n", val);
+				printf("(_main.cpp:591) [ERROR] in bayesFilter3: val overflow at val=%d.\n", val);
 			}
 			*beliefPtr = val;
 			buffPtr++;
@@ -306,108 +629,101 @@ void bayesFilter3(cv::Mat belief, cv::Mat nextProbs) {
 
 }
 
+/* closeSignal: Use this to control the main loop execution. */
 bool closeSignal = false;
 
-void close() {
-	closeSignal = true;
-	wsk->close();
-	while (wsk->getReadyState() != wsk->CLOSED);
-}
-
-BOOL CtrlHandler(DWORD fdwCtrlType)
-{
-	switch (fdwCtrlType)
-	{
-		// Handle the CTRL-C signal. 
-	case CTRL_C_EVENT:
-		printf("Ctrl-C event\n\n");
-		close();
-		Beep(750, 300);
-		return(TRUE);
-
-		// CTRL-CLOSE: confirm that the user wants to exit. 
-	case CTRL_CLOSE_EVENT:
-		Beep(600, 200);
-		printf("Ctrl-Close event\n\n");
-		return(TRUE);
-
-		// Pass other signals to the next handler. 
-	case CTRL_BREAK_EVENT:
-		Beep(900, 200);
-		printf("Ctrl-Break event\n\n");
-		return FALSE;
-
-	case CTRL_LOGOFF_EVENT:
-		Beep(1000, 200);
-		printf("Ctrl-Logoff event\n\n");
-		return FALSE;
-
-	case CTRL_SHUTDOWN_EVENT:
-		Beep(750, 500);
-		printf("Ctrl-Shutdown event\n\n");
-		return FALSE;
-
-	default:
-		return FALSE;
-	}
-}
+ /********************************************\
+ *                MAIN METHOD                 * 
+ \********************************************/
 
 int main() {
-	std::cout << "starting...\n";
-	if (!SetConsoleCtrlHandler((PHANDLER_ROUTINE)CtrlHandler, TRUE))
-	{
-		printf("\nERROR: Could not set control handler");
-		return 1;
-	}
-
+	std::cout << "(_main.cpp:609) [INFO] Starting...\n";
+	
 
 	// Robot Initialization
-	/*CreateData	robotData;
+
+	CreateData	robotData;
 	RobotConnector	robot;
 	if (!robot.Connect(Create_Comport))
 	{
-	cout << "Error : Can't connect to robot @" << Create_Comport << endl;
-	return -1;
+		std::cout << "(_main.cpp:618) [FATAL] Cannot connect to robot @" << Create_Comport << "\nExiting...\n";
+		return -1;
+	}
+	else {
+		std::cout << "(_main.cpp:622) [INFO ] Connected to robot @" << Create_Comport << "\n";
 	}
 	robot.DriveDirect(0, 0);
-	cvNamedWindow("Robot");
-	*/
+
 
 	// Kinect Initialization
-	KinectConnector kin = KinectConnector();
-	if (!kin.Connect()) return 1;
-	std::cout << "initialized kinect\n";
 
-	// Grid Variables
+	KinectConnector kin = KinectConnector();
+	if (!kin.Connect()) {
+		std::cout << "(_main.cpp:631) [FATAL] Cannot initialize Kinect!\nExiting...\n";
+		return -2;
+	}
+	else {
+		std::cout << "(_main.cpp:635) [INFO ] Initialized Kinect\n";
+	}
+	
+
+	// BEGIN Grid Variables
+
+	/* There are two types of Grids: 
+	 *  - Smooth Grids (which will also be referred to as simply 'Grid'.
+	 *  - Rough Grids
+	 * Smooth Grids are for vision purpose (e.g. The main grid to display).
+	 * Rough Grids are for motion planning purpose (e.g. cSpace).
+	 */
+	
+	// Grids Resolution (less = More resolution).
 	double MILLIS_PER_GRID = 40;				// Cannot do less than 20 due to grid rough datatype size limit (uint16_t)
 	double ROUGH_MILLIS_PER_GRID = 160;
-	int GRID_HEIGHT = 7200 / MILLIS_PER_GRID;	// world size in mm
-	int GRID_WIDTH = 9600 / MILLIS_PER_GRID;	// world size in mm
-	int ROUGH_GRID_HEIGHT = 7200 / ROUGH_MILLIS_PER_GRID;	// world size in mm
-	int ROUGH_GRID_WIDTH = 9600 / ROUGH_MILLIS_PER_GRID;	// world size in mm
-	std::cout << "GRID SIZE = " << GRID_HEIGHT << "x" << GRID_WIDTH << "\n";
+	
+	// World Size (default at 7.2m x 9.6m)
+	int WORLD_HEIGHT_MILLIS = 7200;		
+	int WORLD_WIDTH_MILLIS = 9600;
+
+	// Grid Sizes (Calculated)
+	int GRID_HEIGHT = WORLD_HEIGHT_MILLIS / MILLIS_PER_GRID;
+	int GRID_WIDTH = WORLD_WIDTH_MILLIS / MILLIS_PER_GRID;
+	int ROUGH_GRID_HEIGHT = WORLD_HEIGHT_MILLIS / ROUGH_MILLIS_PER_GRID;
+	int ROUGH_GRID_WIDTH = WORLD_WIDTH_MILLIS / ROUGH_MILLIS_PER_GRID;
+	std::cout << "(_main.cpp:661) [INFO] GRID SIZE = " << GRID_HEIGHT << "x" << GRID_WIDTH << "\n";
+
+	// (Main) Grid View Port
 	int GRID_VIEW_HEIGHT = 480;
 	int GRID_VIEW_WIDTH = 640;
 	cv::namedWindow("GRID VIEW", cv::WINDOW_NORMAL);
 	cv::resizeWindow("GRID VIEW", GRID_VIEW_WIDTH, GRID_VIEW_HEIGHT);
-	cv::Mat grid;											 // Main Grid Object (Greyscale)
-	cv::Mat gridView;										 // Grid Object use for viewing (RGB)
-	cv::Mat gridInt;
-	cv::Mat gridRough;										// Use for motion planning
-	cv::Mat cBuff;
-	cv::Mat cSpace;											// (0 or 1) indicating C-Space
 
+	// Grid Objects Declarations
+	cv::Mat grid;						// Main Grid Object (Float, Greyscale)
+	cv::Mat gridView;					// Grid Object use for viewing (RGB Image)
+	cv::Mat gridInt;					// Main Grid Objected converted to `uchar` (Greyscale)
+	cv::Mat gridRough;					// Rough Grid Object used as intermediate for cSpace Calculation
+	cv::Mat cBuff;						// Rough Grid Object used as intermediate for cSpace Calculation
+	cv::Mat cSpace;						// Rough Grid Object indicating C-Space (values are either 0 or 1) 
+	cv::Mat robotMap;                   // Robotmap for move
+
+	// Grid Objects Initialization.
 	grid = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_32FC1, cv::Scalar(127));
-	gridInt = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_8UC1, cv::Scalar(127));
 	gridView = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_8UC3);
+	gridInt = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_8UC1, cv::Scalar(127));
 	gridRough = cv::Mat(ROUGH_GRID_HEIGHT, ROUGH_GRID_WIDTH, CV_16UC1, cv::Scalar(0));
 	cBuff = cv::Mat(ROUGH_GRID_HEIGHT, ROUGH_GRID_WIDTH, CV_8UC1, cv::Scalar(0));
 	cSpace = cv::Mat(ROUGH_GRID_HEIGHT, ROUGH_GRID_WIDTH, CV_8UC1, cv::Scalar(0));
+	robotMap = cv::Mat(ROUGH_GRID_HEIGHT/10, ROUGH_GRID_WIDTH/10, CV_8UC1, cv::Scalar(0));
 
-	// Get from GPS
+	// END Grid Variables
+
+
+	// Robot Variables
 	cv::Point robotPoint(GRID_WIDTH / 2, GRID_HEIGHT / 2);	 // Current robot Position in Grid
-	long double robotDirection = 0.0;						 // Robot Direction in range (-180, 180)
-	int robotSize = 330;
+	const int robotSize = 330;
+
+	// Loop variables
+	long double objectDirection = 0.0;					
 
 	double KINECT_FOV_H = NUI_CAMERA_COLOR_NOMINAL_HORIZONTAL_FOV;
 	double KINECT_FOV_V = NUI_CAMERA_DEPTH_NOMINAL_VERTICAL_FOV;
@@ -416,10 +732,22 @@ int main() {
 	int loop_index = 0;				// Count how many loops have passed, use for debugging.
 									//int dt = robotData.distance;
 
-	// Enable Measuring
-	enableMeasuring = false;
+									// Enable Measuring
+	enableMeasuring = true;
+	int objectDistMin = 1000000;
 
-									// Web Socket Initialization	
+	const int scanCountRst = 8;
+	int scanCount = 0;
+	const int SCAN_TURNING_DEGREES = 45;
+
+#define ROBOT_STATE_MOVE 0
+#define ROBOT_STATE_TURN 1
+#define ROBOT_STATE_SCAN 2
+
+	int robotState = ROBOT_STATE_SCAN;
+	int findObstrucle = 0;
+
+	// Web Socket Initialization	
 	std::cout << "initializing ws...\n";
 #ifdef _WIN32
 	INT rc;
@@ -432,7 +760,7 @@ int main() {
 	}
 #endif
 
-	wsk = WebSocket::from_url("ws://192.168.1.59:8081/pose");
+	wsk = WebSocket::from_url("ws://192.168.1.59:8080/pose");
 	assert(wsk);
 
 	//while (wsk->getReadyState() != WebSocket::CLOSED) {
@@ -448,12 +776,138 @@ int main() {
 	//WSACleanup();
 	//#endif
 
-
+	int scansucceed = 0;
+	int numturn = 0; 
+	int movingCounter = 0;
 	cv::Mat nextProbs = cv::Mat(GRID_HEIGHT, GRID_WIDTH, CV_32FC1, cv::Scalar(0.5));
-
 	// Main Loop // 
 	while (!closeSignal) {
+
+		printf("_main.cpp:698 GPS get\n");
+		wsk->send("GET");
+		wsk->poll(-1);
+		wsk->dispatch(handle_message);
+		x_avg = our_gps.x;
+		y_avg = our_gps.y;
+		ang_avg = our_gps.angle;
+
+		printf("(_main.cpp:523) <%d> Read GPS: ang = %lf, x = %lf, y = %lf\n", loop_index, our_gps.angle, our_gps.x, our_gps.y);
+
+		/*if (!findObstrucle) {
+			cout << "CP";
+			cv::Mat depthImg;
+			cv::Mat colorImg;
+			cv::Mat indexImg;
+			cv::Mat pointImg;
+			// Get Data from Kinect to find obstrucle
+			kin.GrabData(depthImg, colorImg, indexImg, pointImg);
+
+			if (our_gps.x - 1 > 0 || our_gps.x + 1 < cSpace.cols || our_gps.y - 1 > 0 || our_gps.y + 1 < cSpace.cols) {
+				if (depthImg.ptr<int>()) {
+					moveForward(robot, 10);
+					continue;
+				}
+				else {
+					findObstrucle = 1;
+				}
+
+			}
+			else {
+				findObstrucle = 1;
+			}
+		}*/
+		// Switch robot State //
+
+
+		/*switch (robotState) {
+		case ROBOT_STATE_MOVE:
+		enableMeasuring = false;
+		if (objectDistMin <= 700) {
+		turnLeft(robot, 120);
+		robotState = ROBOT_STATE_SCAN;
+		}
+		break;
+		case ROBOT_STATE_TURN:
+		enableMeasuring = true;
+		if (scanCount >= scanCountRst) {
+		scanCount = 0;
+		robotState = ROBOT_STATE_MOVE;
+		}
+		else {
+		if (loop_index % 10 == 0) {
+		scanCount++;
+		}
+		robotState = ROBOT_STATE_TURN;
+		}
+		break;
+		case ROBOT_STATE_SCAN :
+		enableMeasuring = false;
+		}*/
+		
+		int direc;
+		double diffang;
+		cout << "RobotState : " << robotState << endl;
+		switch ( robotState ) {
+		case ROBOT_STATE_MOVE:
+			cout << "State move1" << endl;
+			if (movingCounter == 0) {
+				moveForward(robot, 400);
+			}
+			else {
+				moveForward(robot, 300);
+			}
+
+			movingCounter = !movingCounter;
+			robotState = ROBOT_STATE_SCAN;
+			break;
+		case ROBOT_STATE_TURN:
+			cout << "State turn" << endl;
+			/*diffang =  calculateangle(x_avg, y_avg,ang_avg) - ang_avg ;
+			cout << "Diffang : " << diffang  << endl;
+			if (diffang < -180) {
+				diffang = diffang + 360;
+			}
+			else if (diffang > 180) {
+				diffang = diffang - 360;
+			}
+			if (diffang < 0) {
+				turnRight(robot, -diffang);
+				cout << "Turn Right ";
+			}
+			else {
+				turnLeft(robot, diffang);
+				cout << "Turn Left ";
+			}
+			cout << "Diffang : " << diffang << endl;*/
+			turnLeft(robot, 90);
+			cout << "Ang_avg " << ang_avg << endl;
+			robotState = ROBOT_STATE_MOVE;
+			break;
+		case ROBOT_STATE_SCAN:
+			cout << "scancount : " << scanCount << endl;
+			if (scansucceed) {
+				turnLeft(robot, 45);
+				scansucceed = 0;
+				if (scanCount == 8) {
+					scanCount = 0;
+					robotState = ROBOT_STATE_TURN;
+				}
+				break; 
+			}
+		}
+
+		if (robotState != ROBOT_STATE_SCAN) {
+			cout << "x_avg : " << x_avg << " y_avg : " << y_avg << " ang : " << ang_avg << endl;
+			continue;
+		}
+		if (numturn == 5) {
+			break;
+		}
+
+		printf("_main.cpp:830 finished state case\n");
+		
 		// *_in_buff is used as median of 4 values
+		/*
 		x_avg = 0;
 		y_avg = 0;
 		ang_avg = 0;
@@ -463,7 +917,7 @@ int main() {
 		semaphore = semaphore_rst;
 
 		for (int i = 0; i < 4; i++) {
-			
+
 		}
 		int sem_cnt = 0;
 		while (semaphore != 0) {
@@ -486,9 +940,12 @@ int main() {
 			std::cout << *it << " ";
 		}
 		std::cout << "\n";
-		x_avg = (x_in_buff[1] + x_in_buff[2] ) / 2;
+		
+		x_avg = (x_in_buff[1] + x_in_buff[2]) / 2;
 		y_avg = (y_in_buff[1] + y_in_buff[2]) / 2;
 		ang_avg = (ang_in_buff[1] + ang_in_buff[2]) / 2;
+		*/
+		
 
 		printf("(_main.cpp:457) <%d> Updated ANG_AVG from GPS\n", loop_index);
 
@@ -509,7 +966,7 @@ int main() {
 		for (int theta = -20; theta <= 20; theta++) {
 			if (theta == 0) {
 				//double fd = (double)theta * colorImg.cols / NUI_CAMERA_COLOR_NOMINAL_HORIZONTAL_FOV;
-				long double fd = 2 * NUI_CAMERA_COLOR_NOMINAL_FOCAL_LENGTH_IN_PIXELS * tan((long double) theta * MATH_PI / 180.0);
+				long double fd = 2 * NUI_CAMERA_COLOR_NOMINAL_FOCAL_LENGTH_IN_PIXELS * tan((long double)theta * MATH_PI / 180.0);
 				uchar* colorImgCenter = colorImg.ptr<uchar>(479, 639 - fd);
 				*colorImgCenter++ = 0;
 				*colorImgCenter++ = 0;
@@ -545,26 +1002,28 @@ int main() {
 		}
 
 		printf("(_main.cpp:500) <%d> Set color dots for colorImg\n", loop_index);
-		
-		imshow("depthImg", depthImg);
-		imshow("colorImg", colorImg);
 
-		printf("(_main.cpp:505) <%d> Showed colorImg and depthImg\n", loop_index);
+		imshow("depthImg", depthImg);
+		//imshow("colorImg", colorImg);
+
+		//printf("(_main.cpp:505) <%d> Showed colorImg and depthImg\n", loop_index);
 
 		robotPoint.x = (x_avg * 10 / MILLIS_PER_GRID) + GRID_WIDTH / 2;
 		robotPoint.y = (y_avg * 10 / MILLIS_PER_GRID) + GRID_HEIGHT / 2;
 		printf("(_main.cpp:523) <%d> ang = %lf, x = %lf, y = %lf\n", loop_index, ang_avg, x_avg, y_avg);
 
+
 		//imshow("indexImg", indexImg);
 		//imshow("pointImg", pointImg);
-		vector<cv::Point> updatePoints;
-		vector<double> updateProbs;
-		vector<cv::Point> objectPoints;
+		std::vector<cv::Point> updatePoints;
+		std::vector<double> updateProbs;
+		std::vector<cv::Point> objectPoints;
+		objectDistMin = 1000000;
 		for (int theta = -20; theta <= 20; theta++) {
 			// theta valid from approx. -30 to 30
 			// pixel_interested = center_pixel + (focal_length * 2 * tan(alpha))
 			//double fd = (double)theta * depthImg.rows / NUI_CAMERA_DEPTH_NOMINAL_HORIZONTAL_FOV;
-			long double fd = 2 * NUI_CAMERA_DEPTH_NOMINAL_FOCAL_LENGTH_IN_PIXELS * tan((long double) theta * MATH_PI / 180.0);
+			long double fd = 2 * NUI_CAMERA_DEPTH_NOMINAL_FOCAL_LENGTH_IN_PIXELS * tan((long double)theta * MATH_PI / 180.0);
 			int16_t averagedPoints[4] = { *depthImg.ptr<int16_t>(239, 319 - fd),
 				*depthImg.ptr<int16_t>(239, 320 - fd),
 				*depthImg.ptr<int16_t>(240, 319 - fd),
@@ -588,18 +1047,18 @@ int main() {
 			}
 
 			// map gps to robot world grid
-			robotDirection = ang_avg + theta;
-			if (robotDirection > 180) {
-				robotDirection -= 360;
+			objectDirection = ang_avg + theta;
+			if (objectDirection > 180) {
+				objectDirection -= 360;
 			}
-			else if (robotDirection < -180) {
-				robotDirection += 360;
+			else if (objectDirection < -180) {
+				objectDirection += 360;
 			}
 
 			if (false) {
 				std::cout << "theta = " << theta << "\n";
 				std::cout << "ang_avg = " << ang_avg << ", theta = " << theta << "\n";
-				std::cout << "center: depth = " << averagedDepth << ", dir = " << robotDirection << ", pos=(" << robotPoint.x << ", " << robotPoint.y << ")\n";
+				std::cout << "center: depth = " << averagedDepth << ", dir = " << objectDirection << ", pos=(" << robotPoint.x << ", " << robotPoint.y << ")\n";
 			}
 
 			cv::Point objectPoint;
@@ -608,8 +1067,9 @@ int main() {
 			long double objectDistMillis = (long double)averagedDepth / abs(cos(theta * MATH_PI / 180.0));
 			bool isValidObjectDist = (objectDistMillis > MILLIS_PER_GRID);
 			objectDistMillis += LASER_CONST;
-			long double objectDistDiffXMillis = objectDistMillis * sin(robotDirection * MATH_PI / 180.0);
-			long double objectDistDiffYMillis = objectDistMillis * cos(robotDirection * MATH_PI / 180.0);
+			objectDistMin = std::min(objectDistMin, (int)objectDistMillis);
+			long double objectDistDiffXMillis = objectDistMillis * sin(objectDirection * MATH_PI / 180.0);
+			long double objectDistDiffYMillis = objectDistMillis * cos(objectDirection * MATH_PI / 180.0);
 			//long double objectDistDiffXMillis = averagedDepth * tan(theta * MATH_PI / 180);
 			//long double objectDistDiffYMillis = averagedDepth;
 			objectPoint.x = objectDistDiffXMillis / MILLIS_PER_GRID + robotPoint.x;
@@ -621,8 +1081,8 @@ int main() {
 
 			// Extrude shadow
 			cv::Point extrudePoint;
-			extrudePoint.x = (150 * sin(robotDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.x;
-			extrudePoint.y = (150 * cos(robotDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.y;
+			extrudePoint.x = (150 * sin(objectDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.x;
+			extrudePoint.y = (150 * cos(objectDirection * MATH_PI / 180)) / MILLIS_PER_GRID + objectPoint.y;
 
 			if (averagedDepth != 0) {
 				// Draw Interpolated from object to extrude point
@@ -635,7 +1095,7 @@ int main() {
 			//printf("(_main.cpp:580) <%d> Get Depth Data from Kinect for theta = %d.\n", loop_index, theta);
 		}
 
-		
+
 
 		// Fill Black
 		for (int i = 0; i < objectPoints.size(); i++) {
@@ -671,11 +1131,11 @@ int main() {
 						//updateProbs.push_back(0.8);
 					}
 					//else {
-						//(*it)[0] = 255; 
-						//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.55;
-						//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = ((((4500-objectDistMillis)/4500)+(30 - abs(theta))/30)/2)*0.1 + 0.5;
-						//updateProbs.push_back(1.25);
-						//break;
+					//(*it)[0] = 255; 
+					//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = 0.55;
+					//(*nextProbs.ptr<float>(it.pos().y, it.pos().x)) = ((((4500-objectDistMillis)/4500)+(30 - abs(theta))/30)/2)*0.1 + 0.5;
+					//updateProbs.push_back(1.25);
+					//break;
 					//}
 				}
 			}
@@ -688,7 +1148,6 @@ int main() {
 			printf("(_main.cpp:635) <%d> Completed bayesFilter3.\n", loop_index);
 		}
 
-
 		// Grid Clipping
 		for (int i = 0; i < GRID_HEIGHT * GRID_WIDTH; i++) {
 			if (grid.data[i] <= 3) grid.data[i] = 3;
@@ -697,7 +1156,7 @@ int main() {
 
 		// Generate GridRough by summing corresponding cells in Grid
 		gridRough.setTo(cv::Scalar(0));
-		
+
 		int ROUGH_FACTOR = ROUGH_MILLIS_PER_GRID / MILLIS_PER_GRID;
 		printf("ROUGH_FACTOR = %d\n", ROUGH_FACTOR);
 		for (int i = 0; i < GRID_HEIGHT; i++) {
@@ -717,7 +1176,8 @@ int main() {
 			for (int j = 0; j < ROUGH_GRID_WIDTH; j++) {
 				if (*gridRough.ptr<uint16_t>(i, j) < 90) {
 					*cBuff.ptr<uchar>(i, j) = 0;		// FREE
-				} else if (*gridRough.ptr<uint16_t>(i, j) > 160) {
+				}
+				else if (*gridRough.ptr<uint16_t>(i, j) > 160) {
 					*cBuff.ptr<uchar>(i, j) = 2;		// OBJ
 				}
 				//*cBuff.ptr<uchar>(i, j) *= 127;
@@ -726,8 +1186,8 @@ int main() {
 		}
 
 		// Set C-Space
-		
-		int C_FACTOR = robotSize / (ROUGH_MILLIS_PER_GRID * 2 );
+
+		int C_FACTOR = robotSize / (ROUGH_MILLIS_PER_GRID * 2);
 		for (int i = 0; i < ROUGH_GRID_HEIGHT; i++) {
 			for (int j = 0; j < ROUGH_GRID_WIDTH; j++) {
 				if (*cBuff.ptr<uchar>(i, j) == 2) {
@@ -741,7 +1201,15 @@ int main() {
 			}
 		}
 
+		for (int i = 0; i < ROUGH_GRID_HEIGHT; i++) {
+			for (int j = 0; j < ROUGH_GRID_WIDTH; j++) {
+				*cSpace.ptr<uchar>(i, j) *= 127;
+			}
+		}
 
+		imshow("cSpace", cSpace);
+
+		// DISPLAY //
 
 		// Convert Grid to Int
 
@@ -792,6 +1260,40 @@ int main() {
 			}
 		}
 
+		// Purple Boundary GPS
+		uchar* boundaryPixel;
+		cv::Point topLeftBoundary, bottomRightBoundary;
+		int GPS_BOUND_OFFSET_X_MM = 2400;
+		int GPS_BOUND_OFFSET_Y_MM = 1800;
+		topLeftBoundary.x = (GRID_WIDTH / 2) - (GPS_BOUND_OFFSET_X_MM / MILLIS_PER_GRID);
+		topLeftBoundary.y = (GRID_HEIGHT / 2) - (GPS_BOUND_OFFSET_Y_MM / MILLIS_PER_GRID);
+		bottomRightBoundary.x = (GRID_WIDTH / 2) + (GPS_BOUND_OFFSET_X_MM / MILLIS_PER_GRID);
+		bottomRightBoundary.y = (GRID_HEIGHT / 2) + (GPS_BOUND_OFFSET_Y_MM / MILLIS_PER_GRID);
+
+		// Top & Bottom
+		for (int i = topLeftBoundary.x; i <= bottomRightBoundary.x; i++) {
+			boundaryPixel = gridView.ptr<uchar>(topLeftBoundary.y, i);
+			*boundaryPixel++ = 200;
+			*boundaryPixel++ = 75;
+			*boundaryPixel = 255;
+			boundaryPixel = gridView.ptr<uchar>(bottomRightBoundary.y, i);
+			*boundaryPixel++ = 200;
+			*boundaryPixel++ = 75;
+			*boundaryPixel = 255;
+		}
+
+		// Left & Right
+		for (int i = topLeftBoundary.y; i <= bottomRightBoundary.y; i++) {
+			boundaryPixel = gridView.ptr<uchar>(i, topLeftBoundary.x);
+			*boundaryPixel++ = 200;
+			*boundaryPixel++ = 75;
+			*boundaryPixel = 255;
+			boundaryPixel = gridView.ptr<uchar>(i, bottomRightBoundary.x);
+			*boundaryPixel++ = 200;
+			*boundaryPixel++ = 75;
+			*boundaryPixel = 255;
+		}
+
 		// Direction Green
 		uchar* dirPixel;
 		if (ang_avg < -135 || ang_avg > 135) {
@@ -838,16 +1340,22 @@ int main() {
 
 
 		printf("(_main.cpp:735) <%d> Show GRID_VIEW Image.\n", loop_index);
-
 		int userInput = cv::waitKey(100);
 		if (userInput == ' ') {
 			enableMeasuring = !enableMeasuring;
 		}
 
 		printf("(_main.cpp:742) <%d> Waited for user input (cvWaitKey).\n", loop_index);
-		
 		loop_index++;
+
+		if ((loop_index % 8) == 0) {
+			scanCount++;
+			scansucceed = 1;
+		}
+		
 		//printf("===============================================\n");
+
+
 	}
 	return 0;
 }
