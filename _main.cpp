@@ -128,8 +128,8 @@ void _movePrototype(RobotConnector &robot, double vx, double vz, double millis) 
 	isExpectedStationary = false;
 	if (!robot.DriveDirect(velL, velR))
 		std::cout << "(_main.cpp:91) [ERROR] SetControl Fail\n";
-
-	Sleep(millis);
+	short _millis = (short)millis;
+	Sleep(_millis);
 
 	if (!robot.DriveDirect(0, 0))
 		std::cout << "(_main.cpp:96) [ERROR] SetControl Fail\n";
@@ -149,7 +149,7 @@ void turnRight(RobotConnector &robot, double angle) {
 	vx = 0;
 	vz = -0.5;
 	double factor = 10.0;		// Conversion factor from angle to turning time.
-	long millis = angle * factor;
+	long millis = (long)(angle * factor);
 
 	_movePrototype(robot, vx, vz, millis);
 }
@@ -165,7 +165,7 @@ void turnLeft(RobotConnector &robot, double angle) {
 	vz = 0.5;
 
 	double factor = 10.0;		// Conversion factor from angle to turning time.
-	long millis = angle * factor;
+	long millis = (long)(angle * factor);
 
 	_movePrototype(robot, vx, vz, millis);
 }
@@ -181,7 +181,7 @@ void moveForward(RobotConnector &robot, double length) {
 	vz = 0;
 
 	double factor = 40.0;	// Conversion factor from length to turning time.
-	long millis = length * factor;
+	long millis = (long)(length * factor);
 
 	_movePrototype(robot, vx, vz, millis);
 }
@@ -198,7 +198,7 @@ void moveBackward(RobotConnector &robot, double length) {
 	vz = 0;
 
 	double factor = 40.0;	// Conversion factor from length to turning time.
-	long millis = length * factor;
+	long millis = (long)(length * factor);
 
 	_movePrototype(robot, vx, vz, millis);
 }
@@ -389,6 +389,8 @@ mempath.push(ben.position);
 */
 
 
+
+bool gpsUpdated = false;
 /* handle_message: use this to handle an event-received message by WebSocket.
 * The current implementation is to regex into the message and find gps_t which id == 5.
 * Additionally, WebSocket will also close if the string 'end' is found in the response message.
@@ -451,6 +453,7 @@ void handle_message(const std::string & message)
 			ang_avg = (our_gps.angle + ang_avg) / 2;
 			x_avg = (our_gps.x + x_avg) / 2;
 			y_avg = (our_gps.y + y_avg) / 2;
+			gpsUpdated = true;
 		}
 		s = sm.suffix().str();
 	}
@@ -703,7 +706,7 @@ int main() {
 		std::cout << "(_main.cpp:622) [INFO ] Connected to robot @" << Create_Comport << "\n";
 	}
 	robot.DriveDirect(0, 0);
-
+	robot.LEDs(false, false, 0, 255);
 
 	// Kinect Initialization
 
@@ -833,12 +836,32 @@ int main() {
 	//WSACleanup();
 	//#endif
 
+	// Initial Realign
+
+	wsk->send("GET");
+	while (ang_avg == 0) {
+		printf("_main.cpp:698 GPS get\n");
+		wsk->poll(-1);
+		wsk->dispatch(handle_message);
+	}
+	// Remove Averaging effect
+	ang_avg *= 2;
+	x_avg *= 2;
+	y_avg *= 2;
+
+	realignToZero(robot);
+	int initialScanCount = 8;
+
+	
 	int scansucceed = 0;
 	int numturn = 0;
 	int movingCounter = 0;
+
 	// Main Loop // 
+	
 	while (!closeSignal) {
 
+		gpsUpdated = false;
 		for (int i = 0; i < 4; i++) {
 			printf("_main.cpp:698 GPS get\n");
 			wsk->send("GET");
@@ -847,6 +870,8 @@ int main() {
 		}
 
 		printf("(_main.cpp:523) <%d> Read GPS: ang = %lf, x = %lf, y = %lf\n", loop_index, our_gps.angle, our_gps.x, our_gps.y);
+
+
 
 		/*if (!findObstrucle) {
 		cout << "CP";
@@ -1316,6 +1341,79 @@ int main() {
 		imshow("C-SPACE VIEW", cSpaceView);
 		
 
+		// MOVING (Kris) //
+
+		// default move forward if empty
+
+		bool step = (loop_index % 8 == 7);
+		if (step) {
+			if (initialScanCount > 0) {
+				// initial scan conditions
+				initialScanCount--;
+				turnLeft(robot, 45);
+			}
+			else {
+				// normal conditions
+				int robotDirection;
+				const int SOUTH = 0;
+				const int WEST = 1;
+				const int NORTH = 2;
+				const int EAST = 3;
+				if (ang_avg >= 135 || ang_avg <= -135) {
+					robotDirection = SOUTH;
+				}
+				else if (ang_avg >= 45 && ang_avg <= 135) {
+					robotDirection = WEST;
+				}
+				else if (ang_avg >= -45 && ang_avg <= 45) {
+					robotDirection = NORTH;
+				}
+				else if (ang_avg >= -135 && ang_avg <= -45) {
+					robotDirection = EAST;
+				}
+
+				cv::Point robotPointRough;
+				robotPointRough.x = robotPoint.x / ROUGH_FACTOR;
+				robotPointRough.y = robotPoint.y / ROUGH_FACTOR;
+
+				// neighbours in order of (SOUTH, WEST, NORTH, EAST)
+				uchar neighbours[4] = { *cSpace.ptr<uchar>(robotPointRough.y - 1, robotPointRough.x),
+					*cSpace.ptr<uchar>(robotPointRough.y, robotPointRough.x - 1),
+					*cSpace.ptr<uchar>(robotPointRough.y + 1, robotPointRough.x),
+					*cSpace.ptr<uchar>(robotPointRough.y, robotPointRough.x + 1) };
+				int i;
+				for (i = 0; i < 4; i++) {
+					int nt = (robotDirection + i) % 4;
+					if (nt == 0) {
+						// if neightbouring tile is an empty space
+						break;
+					}
+				}
+				switch(i) {
+				case 0: 
+					moveForward(robot, 18);
+					break;
+				case 1:
+					turnLeft(robot, 90);
+					moveForward(robot, 18);
+					break;
+				case 2:
+					turnLeft(robot, 180);
+					moveForward(robot, 18);
+					break;
+				case 3:
+					turnRight(robot, 90);
+					moveForward(robot, 18);
+					break;
+				case 4: 
+					printf("(_main.cpp:1393) [ERROR] <%d> cannot found available grid cell to move to. \n", loop_index);
+					break;
+				} 
+
+			}
+		}
+
+
 		// DISPLAY //
 
 		// Convert Grid to Int
@@ -1477,10 +1575,6 @@ int main() {
 		printf("(_main.cpp:1391) <%d> Waited for user input (cvWaitKey), received char %d.\n", loop_index, userInput);
 		loop_index++;
 
-		if ((loop_index % 8) == 0) {
-			scanCount++;
-			scansucceed = 1;
-		}
 
 		//printf("===============================================\n");
 
